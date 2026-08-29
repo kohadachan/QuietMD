@@ -1,4 +1,6 @@
-use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{
+    Alignment as CmarkAlignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd,
+};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TextStyle {
@@ -16,16 +18,45 @@ pub struct StyleSpan {
     pub style: TextStyle,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TableAlignment {
+    #[default]
+    Default,
+    Left,
+    Center,
+    Right,
+}
+
+impl From<CmarkAlignment> for TableAlignment {
+    fn from(value: CmarkAlignment) -> Self {
+        match value {
+            CmarkAlignment::None => Self::Default,
+            CmarkAlignment::Left => Self::Left,
+            CmarkAlignment::Center => Self::Center,
+            CmarkAlignment::Right => Self::Right,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BlockKind {
     Paragraph,
     Heading(u8),
     Quote,
-    ListItem { depth: usize },
+    ListItem {
+        depth: usize,
+    },
     Code,
     Rule,
-    TableRow { header: bool },
-    Image { source: String, alt: String },
+    TableRow {
+        header: bool,
+        cells: Vec<String>,
+        alignments: Vec<TableAlignment>,
+    },
+    Image {
+        source: String,
+        alt: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -94,11 +125,17 @@ struct TableState {
     header: bool,
     row: Vec<String>,
     cell: Option<String>,
+    alignments: Vec<TableAlignment>,
 }
 
 struct ImageState {
     source: String,
     alt: String,
+}
+
+struct LinkState {
+    destination: String,
+    label: String,
 }
 
 pub fn parse(markdown: &str) -> Document {
@@ -117,6 +154,7 @@ pub fn parse(markdown: &str) -> Document {
     let mut quote_depth = 0usize;
     let mut table: Option<TableState> = None;
     let mut image: Option<ImageState> = None;
+    let mut link: Option<LinkState> = None;
 
     for event in Parser::new_ext(markdown, options) {
         match event {
@@ -176,7 +214,12 @@ pub fn parse(markdown: &str) -> Document {
                         });
                     }
                 }
-                Tag::Table(_) => table = Some(TableState::default()),
+                Tag::Table(alignments) => {
+                    table = Some(TableState {
+                        alignments: alignments.into_iter().map(TableAlignment::from).collect(),
+                        ..TableState::default()
+                    })
+                }
                 Tag::TableHead => {
                     if let Some(state) = table.as_mut() {
                         state.header = true;
@@ -196,7 +239,13 @@ pub fn parse(markdown: &str) -> Document {
                 Tag::Emphasis => style.italic = true,
                 Tag::Strong => style.bold = true,
                 Tag::Strikethrough => style.strike = true,
-                Tag::Link { .. } => style.link = true,
+                Tag::Link { dest_url, .. } => {
+                    style.link = true;
+                    link = Some(LinkState {
+                        destination: dest_url.into_string(),
+                        label: String::new(),
+                    });
+                }
                 Tag::Image { dest_url, .. } => {
                     finish(&mut draft, &mut blocks);
                     image = Some(ImageState {
@@ -218,10 +267,14 @@ pub fn parse(markdown: &str) -> Document {
                 TagEnd::Item => finish(&mut draft, &mut blocks),
                 TagEnd::TableHead => {
                     if let Some(state) = table.as_mut() {
-                        let text = format!("│ {} │", state.row.join(" │ "));
+                        let cells = state.row.clone();
                         blocks.push(Block {
-                            kind: BlockKind::TableRow { header: true },
-                            text,
+                            kind: BlockKind::TableRow {
+                                header: true,
+                                cells: cells.clone(),
+                                alignments: state.alignments.clone(),
+                            },
+                            text: cells.join("\t"),
                             spans: Vec::new(),
                         });
                         state.header = false;
@@ -236,12 +289,14 @@ pub fn parse(markdown: &str) -> Document {
                 }
                 TagEnd::TableRow => {
                     if let Some(state) = table.as_ref() {
-                        let text = format!("│ {} │", state.row.join(" │ "));
+                        let cells = state.row.clone();
                         blocks.push(Block {
                             kind: BlockKind::TableRow {
                                 header: state.header,
+                                cells: cells.clone(),
+                                alignments: state.alignments.clone(),
                             },
-                            text,
+                            text: cells.join("\t"),
                             spans: Vec::new(),
                         });
                     }
@@ -250,7 +305,22 @@ pub fn parse(markdown: &str) -> Document {
                 TagEnd::Emphasis => style.italic = false,
                 TagEnd::Strong => style.bold = false,
                 TagEnd::Strikethrough => style.strike = false,
-                TagEnd::Link => style.link = false,
+                TagEnd::Link => {
+                    style.link = false;
+                    if let Some(value) = link.take() {
+                        let destination = value.destination.trim();
+                        if !destination.is_empty() && value.label.trim() != destination {
+                            let suffix = format!(" 〈{destination}〉");
+                            if let Some(state) = table.as_mut()
+                                && let Some(cell) = state.cell.as_mut()
+                            {
+                                cell.push_str(&suffix);
+                            } else if let Some(current) = draft.as_mut() {
+                                current.append(&suffix, TextStyle::default());
+                            }
+                        }
+                    }
+                }
                 TagEnd::Image => {
                     if let Some(value) = image.take() {
                         blocks.push(Block {
@@ -266,6 +336,9 @@ pub fn parse(markdown: &str) -> Document {
                 _ => {}
             },
             Event::Text(value) => {
+                if let Some(value_link) = link.as_mut() {
+                    value_link.label.push_str(&value);
+                }
                 if let Some(value_image) = image.as_mut() {
                     value_image.alt.push_str(&value);
                 } else if let Some(state) = table.as_mut()
@@ -280,7 +353,12 @@ pub fn parse(markdown: &str) -> Document {
                 }
             }
             Event::Code(value) => {
-                if let Some(state) = table.as_mut()
+                if let Some(value_link) = link.as_mut() {
+                    value_link.label.push_str(&value);
+                }
+                if let Some(value_image) = image.as_mut() {
+                    value_image.alt.push_str(&value);
+                } else if let Some(state) = table.as_mut()
                     && let Some(cell) = state.cell.as_mut()
                 {
                     cell.push_str(&value);
@@ -294,8 +372,34 @@ pub fn parse(markdown: &str) -> Document {
                     style.code = previous;
                 }
             }
-            Event::SoftBreak => append_break(&mut draft, " "),
-            Event::HardBreak => append_break(&mut draft, "\n"),
+            Event::SoftBreak => {
+                if let Some(value_link) = link.as_mut() {
+                    value_link.label.push(' ');
+                }
+                if let Some(value_image) = image.as_mut() {
+                    value_image.alt.push(' ');
+                } else if let Some(state) = table.as_mut()
+                    && let Some(cell) = state.cell.as_mut()
+                {
+                    cell.push(' ');
+                } else {
+                    append_break(&mut draft, " ");
+                }
+            }
+            Event::HardBreak => {
+                if let Some(value_link) = link.as_mut() {
+                    value_link.label.push(' ');
+                }
+                if let Some(value_image) = image.as_mut() {
+                    value_image.alt.push(' ');
+                } else if let Some(state) = table.as_mut()
+                    && let Some(cell) = state.cell.as_mut()
+                {
+                    cell.push('\n');
+                } else {
+                    append_break(&mut draft, "\n");
+                }
+            }
             Event::Rule => {
                 finish(&mut draft, &mut blocks);
                 blocks.push(Block {
@@ -441,10 +545,12 @@ mod tests {
 
     #[test]
     fn parses_table_rows_and_images() {
-        let doc = parse("| A | B |\n|---|---|\n| 1 | 2 |\n\n![alt](image.png)");
+        let doc = parse("| A | B |\n|---|---:|\n| 1 | 2 |\n\n![alt](image.png)");
         assert!(matches!(
-            doc.blocks[0].kind,
-            BlockKind::TableRow { header: true }
+            &doc.blocks[0].kind,
+            BlockKind::TableRow { header: true, cells, alignments }
+                if cells == &["A".to_string(), "B".to_string()]
+                    && alignments == &[TableAlignment::Default, TableAlignment::Right]
         ));
         assert!(matches!(
             doc.blocks[2].kind,
@@ -459,9 +565,36 @@ mod tests {
             "| GameObject | Timeline |\n|---|---|\n| `Rocket` | RocketTail.playable |\n| `SW_RocketTail` | RocketTail |\n\nAfter",
         );
         assert_eq!(doc.blocks.len(), 4);
-        assert_eq!(doc.blocks[1].text, "│ Rocket │ RocketTail.playable │");
-        assert_eq!(doc.blocks[2].text, "│ SW_RocketTail │ RocketTail │");
+        assert_eq!(doc.blocks[1].text, "Rocket\tRocketTail.playable");
+        assert_eq!(doc.blocks[2].text, "SW_RocketTail\tRocketTail");
+        assert!(matches!(
+            &doc.blocks[1].kind,
+            BlockKind::TableRow { cells, .. }
+                if cells == &["Rocket".to_string(), "RocketTail.playable".to_string()]
+        ));
         assert_eq!(doc.blocks[3].text, "After");
+    }
+
+    #[test]
+    fn keeps_inline_code_inside_image_alt_text() {
+        let doc = parse("![see `foo`](image.png)");
+        assert_eq!(doc.blocks.len(), 1);
+        assert!(matches!(
+            &doc.blocks[0].kind,
+            BlockKind::Image { source, alt }
+                if source == "image.png" && alt == "see foo"
+        ));
+    }
+
+    #[test]
+    fn displays_and_copies_link_destinations_without_duplicate_urls() {
+        let doc = parse("Read [the guide](https://example.com/guide) or <https://example.com>.");
+        assert_eq!(doc.blocks.len(), 1);
+        assert_eq!(
+            doc.blocks[0].text,
+            "Read the guide 〈https://example.com/guide〉 or https://example.com."
+        );
+        assert!(doc.blocks[0].spans.iter().any(|span| span.style.link));
     }
 
     #[test]

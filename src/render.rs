@@ -1,4 +1,4 @@
-use crate::markdown::{BlockKind, Document, StyleSpan};
+use crate::markdown::{BlockKind, Document, StyleSpan, TableAlignment};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Direct2D::Common::{
     D2D_RECT_F, D2D_SIZE_U, D2D1_ALPHA_MODE_UNKNOWN, D2D1_COLOR_F, D2D1_PIXEL_FORMAT,
@@ -13,6 +13,7 @@ use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_ITALIC,
     DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_WEIGHT_NORMAL,
     DWRITE_HIT_TEST_METRICS, DWRITE_LINE_METRICS, DWRITE_LINE_SPACING_METHOD_UNIFORM,
+    DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_TEXT_ALIGNMENT_TRAILING,
     DWRITE_TEXT_METRICS, DWRITE_TEXT_RANGE, DWRITE_WORD_WRAPPING_EMERGENCY_BREAK,
     DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, IDWriteTextLayout,
 };
@@ -25,6 +26,11 @@ const PAGE_NARROW_PADDING: f32 = 16.0;
 const PAGE_TOP_PADDING: f32 = 28.0;
 const CODE_HORIZONTAL_PADDING: f32 = 12.0;
 const CODE_VERTICAL_PADDING: f32 = 12.0;
+const TABLE_CELL_PADDING_X: f32 = 10.0;
+const TABLE_CELL_PADDING_Y: f32 = 7.0;
+const TABLE_MIN_CONTENT_WIDTH: f32 = 40.0;
+// DrawTextLayout is not clipped to this box; the long-block test guards that behavior.
+const TEXT_LAYOUT_BOX_HEIGHT: f32 = 100_000.0;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum FontChoice {
@@ -105,10 +111,20 @@ pub struct LayoutDocument {
 pub struct LayoutBlock {
     kind: BlockKind,
     layout: Option<IDWriteTextLayout>,
+    table_cells: Vec<LayoutCell>,
     x: f32,
     y: f32,
     width: f32,
     height: f32,
+    text_start: u32,
+    text_len: u32,
+}
+
+struct LayoutCell {
+    layout: IDWriteTextLayout,
+    x: f32,
+    y: f32,
+    width: f32,
     text_start: u32,
     text_len: u32,
 }
@@ -153,11 +169,12 @@ impl Renderer {
 
     pub fn layout(&self, document: &Document, viewport_width: f32) -> Result<LayoutDocument> {
         let (page_left, page_width) = page_geometry(viewport_width);
+        let table_column_widths = self.table_column_widths(document, page_width)?;
         let mut y = PAGE_TOP_PADDING;
         let mut blocks = Vec::with_capacity(document.blocks.len());
         let mut plain_text = Vec::new();
 
-        for block in &document.blocks {
+        for (block_index, block) in document.blocks.iter().enumerate() {
             if !blocks.is_empty() {
                 plain_text.push('\n' as u16);
             }
@@ -166,6 +183,7 @@ impl Renderer {
                 blocks.push(LayoutBlock {
                     kind: block.kind.clone(),
                     layout: None,
+                    table_cells: Vec::new(),
                     x: page_left,
                     y: y + 10.0,
                     width: page_width,
@@ -174,6 +192,94 @@ impl Renderer {
                     text_len: 0,
                 });
                 y += 30.0;
+                continue;
+            }
+
+            if let (
+                BlockKind::TableRow {
+                    cells, alignments, ..
+                },
+                Some(column_widths),
+            ) = (&block.kind, &table_column_widths[block_index])
+            {
+                let continues_table = block_index > 0
+                    && matches!(
+                        &document.blocks[block_index - 1].kind,
+                        BlockKind::TableRow { .. }
+                    );
+                if !blocks.is_empty() && !continues_table {
+                    y += 8.0;
+                }
+
+                let mut table_cells = Vec::with_capacity(column_widths.len());
+                let mut column_left = page_left;
+                let mut row_content_height: f32 = 18.0;
+                for (column_index, content_width) in column_widths.iter().copied().enumerate() {
+                    if column_index > 0 {
+                        plain_text.push('\t' as u16);
+                    }
+                    let cell_text = cells.get(column_index).map(String::as_str).unwrap_or("");
+                    let wide: Vec<u16> = cell_text.encode_utf16().collect();
+                    let cell_text_start = plain_text.len() as u32;
+                    plain_text.extend_from_slice(&wide);
+                    let text_layout = unsafe {
+                        self.dwrite.CreateTextLayout(
+                            &wide,
+                            &self.body_format,
+                            content_width,
+                            TEXT_LAYOUT_BOX_HEIGHT,
+                        )?
+                    };
+                    unsafe {
+                        text_layout.SetWordWrapping(DWRITE_WORD_WRAPPING_EMERGENCY_BREAK)?;
+                        text_layout.SetTextAlignment(match alignments.get(column_index) {
+                            Some(TableAlignment::Center) => DWRITE_TEXT_ALIGNMENT_CENTER,
+                            Some(TableAlignment::Right) => DWRITE_TEXT_ALIGNMENT_TRAILING,
+                            _ => DWRITE_TEXT_ALIGNMENT_LEADING,
+                        })?;
+                    }
+                    let font_size = apply_block_style(
+                        &text_layout,
+                        &block.kind,
+                        wide.len() as u32,
+                        self.settings.font_size as f32,
+                    )?;
+                    apply_line_spacing(&text_layout, self.settings.line_spacing, font_size)?;
+
+                    let mut metrics = DWRITE_TEXT_METRICS::default();
+                    unsafe { text_layout.GetMetrics(&mut metrics)? };
+                    let cell_height = metrics.height.max(18.0);
+                    row_content_height = row_content_height.max(cell_height);
+                    table_cells.push(LayoutCell {
+                        layout: text_layout,
+                        x: column_left + TABLE_CELL_PADDING_X,
+                        y: y + TABLE_CELL_PADDING_Y,
+                        width: content_width,
+                        text_start: cell_text_start,
+                        text_len: wide.len() as u32,
+                    });
+                    column_left += content_width + TABLE_CELL_PADDING_X * 2.0;
+                }
+
+                let row_height = row_content_height + TABLE_CELL_PADDING_Y * 2.0;
+                let text_len = plain_text.len() as u32 - text_start;
+                blocks.push(LayoutBlock {
+                    kind: block.kind.clone(),
+                    layout: None,
+                    table_cells,
+                    x: page_left,
+                    y,
+                    width: page_width,
+                    height: row_height,
+                    text_start,
+                    text_len,
+                });
+                let ends_table = block_index + 1 == document.blocks.len()
+                    || !matches!(
+                        &document.blocks[block_index + 1].kind,
+                        BlockKind::TableRow { .. }
+                    );
+                y += row_height + if ends_table { 14.0 } else { 0.0 };
                 continue;
             }
 
@@ -194,7 +300,7 @@ impl Renderer {
                         alt.trim()
                     };
                     if is_remote_source(source) {
-                        format!("[remote image omitted] {label}")
+                        format!("[remote image omitted] {label}\n{source}")
                     } else {
                         format!("[image] {label}\n{source}")
                     }
@@ -205,8 +311,12 @@ impl Renderer {
             let wide: Vec<u16> = visible_text.encode_utf16().collect();
             plain_text.extend_from_slice(&wide);
             let text_layout = unsafe {
-                self.dwrite
-                    .CreateTextLayout(&wide, &self.body_format, content_width, 100_000.0)?
+                self.dwrite.CreateTextLayout(
+                    &wide,
+                    &self.body_format,
+                    content_width,
+                    TEXT_LAYOUT_BOX_HEIGHT,
+                )?
             };
             unsafe {
                 text_layout.SetWordWrapping(DWRITE_WORD_WRAPPING_EMERGENCY_BREAK)?;
@@ -231,6 +341,7 @@ impl Renderer {
             blocks.push(LayoutBlock {
                 kind: block.kind.clone(),
                 layout: Some(text_layout),
+                table_cells: Vec::new(),
                 x: page_left + indent,
                 y,
                 width: content_width,
@@ -248,24 +359,121 @@ impl Renderer {
         })
     }
 
+    fn table_column_widths(
+        &self,
+        document: &Document,
+        page_width: f32,
+    ) -> Result<Vec<Option<Vec<f32>>>> {
+        let mut widths_by_block = vec![None; document.blocks.len()];
+        let mut start = 0usize;
+        while start < document.blocks.len() {
+            if !matches!(document.blocks[start].kind, BlockKind::TableRow { .. }) {
+                start += 1;
+                continue;
+            }
+            let mut end = start;
+            let mut column_count = 0usize;
+            while end < document.blocks.len() {
+                let BlockKind::TableRow { cells, .. } = &document.blocks[end].kind else {
+                    break;
+                };
+                column_count = column_count.max(cells.len());
+                end += 1;
+            }
+            if column_count == 0 {
+                start = end;
+                continue;
+            }
+
+            let mut natural_widths = vec![0.0f32; column_count];
+            for block in &document.blocks[start..end] {
+                let BlockKind::TableRow { cells, .. } = &block.kind else {
+                    continue;
+                };
+                for (column_index, cell) in cells.iter().enumerate() {
+                    natural_widths[column_index] = natural_widths[column_index]
+                        .max(self.measure_table_cell(cell, &block.kind)?);
+                }
+            }
+            let available_content_width = (page_width
+                - TABLE_CELL_PADDING_X * 2.0 * column_count as f32)
+                .max(column_count as f32);
+            let fitted = fit_column_widths(&natural_widths, available_content_width);
+            for slot in &mut widths_by_block[start..end] {
+                *slot = Some(fitted.clone());
+            }
+            start = end;
+        }
+        Ok(widths_by_block)
+    }
+
+    fn measure_table_cell(&self, text: &str, kind: &BlockKind) -> Result<f32> {
+        if text.is_empty() {
+            return Ok(0.0);
+        }
+        let wide: Vec<u16> = text.encode_utf16().collect();
+        let text_layout = unsafe {
+            self.dwrite.CreateTextLayout(
+                &wide,
+                &self.body_format,
+                TEXT_LAYOUT_BOX_HEIGHT,
+                TEXT_LAYOUT_BOX_HEIGHT,
+            )?
+        };
+        apply_block_style(
+            &text_layout,
+            kind,
+            wide.len() as u32,
+            self.settings.font_size as f32,
+        )?;
+        let mut metrics = DWRITE_TEXT_METRICS::default();
+        unsafe { text_layout.GetMetrics(&mut metrics)? };
+        Ok(metrics.widthIncludingTrailingWhitespace.ceil())
+    }
+
     pub fn hit_test(&self, document: &LayoutDocument, x: f32, y: f32) -> Result<u32> {
-        let text_blocks = document
-            .blocks
-            .iter()
-            .filter(|block| block.layout.is_some() && block.text_len > 0)
-            .collect::<Vec<_>>();
-        let Some(first) = text_blocks.first() else {
+        let mut text_blocks = document.blocks.iter().filter(|block| {
+            (block.layout.is_some() || !block.table_cells.is_empty()) && block.text_len > 0
+        });
+        let Some(first) = text_blocks.next() else {
             return Ok(0);
         };
         if y <= first.y {
             return Ok(first.text_start);
         }
 
-        for block in text_blocks {
+        for block in std::iter::once(first).chain(text_blocks) {
             if y < block.y {
                 return Ok(block.text_start);
             }
             if y <= block.y + block.height {
+                if !block.table_cells.is_empty() {
+                    let cell = block
+                        .table_cells
+                        .iter()
+                        .find(|cell| x < cell.x + cell.width + TABLE_CELL_PADDING_X)
+                        .or_else(|| block.table_cells.last())
+                        .expect("table rows always contain a cell");
+                    let mut trailing = windows::core::BOOL::default();
+                    let mut inside = windows::core::BOOL::default();
+                    let mut metrics = DWRITE_HIT_TEST_METRICS::default();
+                    unsafe {
+                        cell.layout.HitTestPoint(
+                            x - cell.x,
+                            y - cell.y,
+                            &mut trailing,
+                            &mut inside,
+                            &mut metrics,
+                        )?;
+                    }
+                    let trailing_length = if trailing.as_bool() {
+                        metrics.length
+                    } else {
+                        0
+                    };
+                    let local = (metrics.textPosition + trailing_length).min(cell.text_len);
+                    return Ok(cell.text_start + local);
+                }
                 let Some(text_layout) = block.layout.as_ref() else {
                     continue;
                 };
@@ -298,6 +506,9 @@ impl Renderer {
             if y < block.y || y > block.y + block.height {
                 continue;
             }
+            if !block.table_cells.is_empty() {
+                return Ok(Some((block.text_start, block.text_start + block.text_len)));
+            }
             let Some(text_layout) = block.layout.as_ref() else {
                 return Ok(None);
             };
@@ -319,6 +530,7 @@ impl Renderer {
         Ok(None)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn paint(
         &mut self,
         hwnd: HWND,
@@ -345,7 +557,7 @@ impl Renderer {
                     continue;
                 }
 
-                match block.kind {
+                match &block.kind {
                     BlockKind::Rule => target.DrawLine(
                         Vector2 {
                             X: block.x,
@@ -368,15 +580,32 @@ impl Renderer {
                         },
                         &resources.panel_brush,
                     ),
-                    BlockKind::TableRow { .. } => target.FillRectangle(
-                        &D2D_RECT_F {
-                            left: block.x - 12.0,
-                            top: draw_y - 1.0,
-                            right: block.x + block.width + 12.0,
-                            bottom: draw_y + block.height + 1.0,
-                        },
-                        &resources.panel_brush,
-                    ),
+                    BlockKind::TableRow { .. } => {
+                        let bounds = D2D_RECT_F {
+                            left: block.x,
+                            top: draw_y,
+                            right: block.x + block.width,
+                            bottom: draw_y + block.height,
+                        };
+                        target.FillRectangle(&bounds, &resources.panel_brush);
+                        target.DrawRectangle(&bounds, &resources.line_brush, 1.0, None);
+                        for cell in block.table_cells.iter().skip(1) {
+                            let boundary_x = cell.x - TABLE_CELL_PADDING_X;
+                            target.DrawLine(
+                                Vector2 {
+                                    X: boundary_x,
+                                    Y: draw_y,
+                                },
+                                Vector2 {
+                                    X: boundary_x,
+                                    Y: draw_y + block.height,
+                                },
+                                &resources.line_brush,
+                                1.0,
+                                None,
+                            );
+                        }
+                    }
                     BlockKind::Quote => target.FillRectangle(
                         &D2D_RECT_F {
                             left: block.x - 18.0,
@@ -405,9 +634,11 @@ impl Renderer {
                         draw_selection(
                             target,
                             &resources.selection_brush,
-                            block,
                             text_layout,
+                            block.x,
                             draw_y,
+                            block.text_start,
+                            block.text_len,
                             selection,
                         )?;
                     }
@@ -422,6 +653,30 @@ impl Renderer {
                         },
                         text_layout,
                         brush,
+                        D2D1_DRAW_TEXT_OPTIONS_NONE,
+                    );
+                }
+                for cell in &block.table_cells {
+                    let cell_draw_y = cell.y - scroll_y;
+                    if let Some(selection) = selection {
+                        draw_selection(
+                            target,
+                            &resources.selection_brush,
+                            &cell.layout,
+                            cell.x,
+                            cell_draw_y,
+                            cell.text_start,
+                            cell.text_len,
+                            selection,
+                        )?;
+                    }
+                    target.DrawTextLayout(
+                        Vector2 {
+                            X: cell.x,
+                            Y: cell_draw_y,
+                        },
+                        &cell.layout,
+                        &resources.text_brush,
                         D2D1_DRAW_TEXT_OPTIONS_NONE,
                     );
                 }
@@ -511,25 +766,106 @@ impl LayoutDocument {
         let (start, end) = normalized_range(anchor, active, self.text_len());
         self.plain_text[start as usize..end as usize].to_vec()
     }
+
+    pub fn find_text(
+        &self,
+        query: &[u16],
+        start: u32,
+        forward: bool,
+        match_case: bool,
+        whole_word: bool,
+    ) -> Option<(u32, u32)> {
+        find_utf16(
+            &self.plain_text,
+            query,
+            start.min(self.text_len()),
+            forward,
+            match_case,
+            whole_word,
+        )
+    }
+
+    pub fn vertical_range_for_position(&self, position: u32) -> Result<Option<(f32, f32)>> {
+        let position = position.min(self.text_len());
+        for block in &self.blocks {
+            let block_end = block.text_start + block.text_len;
+            if position < block.text_start || position > block_end {
+                continue;
+            }
+
+            if !block.table_cells.is_empty() {
+                let Some(cell) = block
+                    .table_cells
+                    .iter()
+                    .find(|cell| {
+                        position >= cell.text_start && position <= cell.text_start + cell.text_len
+                    })
+                    .or_else(|| block.table_cells.last())
+                else {
+                    return Ok(None);
+                };
+                let local = position.saturating_sub(cell.text_start).min(cell.text_len);
+                let mut point_x = 0.0;
+                let mut point_y = 0.0;
+                let mut metrics = DWRITE_HIT_TEST_METRICS::default();
+                unsafe {
+                    cell.layout.HitTestTextPosition(
+                        local,
+                        false,
+                        &mut point_x,
+                        &mut point_y,
+                        &mut metrics,
+                    )?;
+                }
+                let top = cell.y + point_y;
+                return Ok(Some((top, top + metrics.height)));
+            }
+
+            let Some(text_layout) = block.layout.as_ref() else {
+                return Ok(None);
+            };
+            let local = position
+                .saturating_sub(block.text_start)
+                .min(block.text_len);
+            let mut point_x = 0.0;
+            let mut point_y = 0.0;
+            let mut metrics = DWRITE_HIT_TEST_METRICS::default();
+            unsafe {
+                text_layout.HitTestTextPosition(
+                    local,
+                    false,
+                    &mut point_x,
+                    &mut point_y,
+                    &mut metrics,
+                )?;
+            }
+            let top = block.y + point_y;
+            return Ok(Some((top, top + metrics.height)));
+        }
+        Ok(None)
+    }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_selection(
     target: &ID2D1HwndRenderTarget,
     brush: &ID2D1SolidColorBrush,
-    block: &LayoutBlock,
     text_layout: &IDWriteTextLayout,
+    x: f32,
     draw_y: f32,
+    text_start: u32,
+    text_len: u32,
     selection: (u32, u32),
 ) -> Result<()> {
     let (selection_start, selection_end) = normalized_range(selection.0, selection.1, u32::MAX);
-    let block_end = block.text_start + block.text_len;
-    let start = selection_start.max(block.text_start);
-    let end = selection_end.min(block_end);
+    let text_end = text_start + text_len;
+    let start = selection_start.max(text_start);
+    let end = selection_end.min(text_end);
     if start >= end {
         return Ok(());
     }
 
-    let local_start = start - block.text_start;
+    let local_start = start - text_start;
     let local_length = end - start;
     let initial_capacity = (local_length as usize).clamp(1, 16);
     let mut metrics = vec![DWRITE_HIT_TEST_METRICS::default(); initial_capacity];
@@ -538,7 +874,7 @@ fn draw_selection(
         text_layout.HitTestTextRange(
             local_start,
             local_length,
-            block.x,
+            x,
             draw_y,
             Some(&mut metrics),
             &mut count,
@@ -553,7 +889,7 @@ fn draw_selection(
             text_layout.HitTestTextRange(
                 local_start,
                 local_length,
-                block.x,
+                x,
                 draw_y,
                 Some(&mut metrics),
                 &mut count,
@@ -598,6 +934,141 @@ fn normalized_range(anchor: u32, active: u32, text_len: u32) -> (u32, u32) {
     (start, end)
 }
 
+#[derive(Clone, Copy)]
+struct FoldedChar {
+    value: char,
+    start: u32,
+    end: u32,
+}
+
+fn fold_utf16(value: &[u16], match_case: bool) -> Vec<FoldedChar> {
+    let mut result = Vec::with_capacity(value.len());
+    let mut offset = 0u32;
+    for decoded in std::char::decode_utf16(value.iter().copied()) {
+        let character = decoded.unwrap_or(char::REPLACEMENT_CHARACTER);
+        let length = character.len_utf16() as u32;
+        if match_case {
+            result.push(FoldedChar {
+                value: character,
+                start: offset,
+                end: offset + length,
+            });
+        } else {
+            for folded in character.to_lowercase() {
+                result.push(FoldedChar {
+                    value: folded,
+                    start: offset,
+                    end: offset + length,
+                });
+            }
+        }
+        offset += length;
+    }
+    result
+}
+
+fn find_utf16(
+    text: &[u16],
+    query: &[u16],
+    start: u32,
+    forward: bool,
+    match_case: bool,
+    whole_word: bool,
+) -> Option<(u32, u32)> {
+    if query.is_empty() {
+        return None;
+    }
+    let text = fold_utf16(text, match_case);
+    let query = fold_utf16(query, match_case)
+        .into_iter()
+        .map(|item| item.value)
+        .collect::<Vec<_>>();
+    if query.is_empty() || query.len() > text.len() {
+        return None;
+    }
+
+    let is_word = |value: char| value.is_alphanumeric() || value == '_';
+    let matches_at = |index: usize| {
+        text[index..index + query.len()]
+            .iter()
+            .zip(&query)
+            .all(|(left, right)| left.value == *right)
+            && (!whole_word
+                || (index == 0 || !is_word(text[index - 1].value))
+                    && (index + query.len() == text.len()
+                        || !is_word(text[index + query.len()].value)))
+    };
+    let range_at = |index: usize| (text[index].start, text[index + query.len() - 1].end);
+
+    if forward {
+        let mut wrapped = None;
+        for index in 0..=text.len() - query.len() {
+            if !matches_at(index) {
+                continue;
+            }
+            let range = range_at(index);
+            if range.0 >= start {
+                return Some(range);
+            }
+            wrapped.get_or_insert(range);
+        }
+        wrapped
+    } else {
+        let mut wrapped = None;
+        for index in (0..=text.len() - query.len()).rev() {
+            if !matches_at(index) {
+                continue;
+            }
+            let range = range_at(index);
+            if range.1 <= start {
+                return Some(range);
+            }
+            wrapped.get_or_insert(range);
+        }
+        wrapped
+    }
+}
+
+fn fit_column_widths(natural: &[f32], available: f32) -> Vec<f32> {
+    if natural.is_empty() {
+        return Vec::new();
+    }
+
+    let count = natural.len() as f32;
+    let available = available.max(count);
+    let minimum = TABLE_MIN_CONTENT_WIDTH.min(available / count).max(1.0);
+    let preferred = natural
+        .iter()
+        .map(|width| width.max(minimum))
+        .collect::<Vec<_>>();
+    let preferred_total = preferred.iter().sum::<f32>();
+    let mut widths = if preferred_total <= available {
+        let extra = (available - preferred_total) / count;
+        preferred.iter().map(|width| width + extra).collect()
+    } else {
+        let distributable = (available - minimum * count).max(0.0);
+        let weights = preferred
+            .iter()
+            .map(|width| (width - minimum).max(0.0))
+            .collect::<Vec<_>>();
+        let weight_total = weights.iter().sum::<f32>();
+        if weight_total <= f32::EPSILON {
+            vec![available / count; natural.len()]
+        } else {
+            weights
+                .iter()
+                .map(|weight| minimum + distributable * weight / weight_total)
+                .collect()
+        }
+    };
+
+    let used = widths.iter().take(widths.len() - 1).sum::<f32>();
+    if let Some(last) = widths.last_mut() {
+        *last = (available - used).max(1.0);
+    }
+    widths
+}
+
 fn block_spacing(kind: &BlockKind) -> (f32, f32, f32) {
     match kind {
         BlockKind::Heading(1) => (0.0, 20.0, 10.0),
@@ -628,7 +1099,8 @@ fn apply_block_style(
         BlockKind::Heading(2) => body_size * 1.6,
         BlockKind::Heading(3) => body_size * 1.3,
         BlockKind::Heading(_) => body_size * 1.12,
-        BlockKind::Code | BlockKind::TableRow { .. } => (body_size - 2.0).max(12.0),
+        BlockKind::Code => (body_size - 2.0).max(12.0),
+        BlockKind::TableRow { .. } => (body_size - 1.0).max(11.0),
         BlockKind::Image { .. } => (body_size - 3.0).max(12.0),
         _ => body_size,
     };
@@ -638,11 +1110,11 @@ fn apply_block_style(
             BlockKind::Heading(_) => {
                 layout.SetFontWeight(DWRITE_FONT_WEIGHT_BOLD, range)?;
             }
-            BlockKind::Code | BlockKind::TableRow { .. } => {
+            BlockKind::Code => {
                 layout.SetFontFamilyName(w!("Consolas"), range)?;
-                if matches!(kind, BlockKind::TableRow { header: true }) {
-                    layout.SetFontWeight(DWRITE_FONT_WEIGHT_BOLD, range)?;
-                }
+            }
+            BlockKind::TableRow { header: true, .. } => {
+                layout.SetFontWeight(DWRITE_FONT_WEIGHT_BOLD, range)?;
             }
             _ => {}
         }
@@ -768,7 +1240,8 @@ fn wide_null(value: &str) -> Vec<u16> {
 mod tests {
     use super::{
         DWRITE_TEXT_METRICS, FontChoice, LineSpacingChoice, PAGE_TOP_PADDING, Renderer,
-        ViewSettings, line_metrics, normalized_range, page_geometry,
+        TEXT_LAYOUT_BOX_HEIGHT, ViewSettings, find_utf16, fit_column_widths, line_metrics,
+        normalized_range, page_geometry,
     };
 
     #[test]
@@ -793,6 +1266,85 @@ mod tests {
     }
 
     #[test]
+    fn search_wraps_in_both_directions_and_respects_options() {
+        let text = "Alpha beta ALPHA alphabet"
+            .encode_utf16()
+            .collect::<Vec<_>>();
+        let alpha = "alpha".encode_utf16().collect::<Vec<_>>();
+        assert_eq!(
+            find_utf16(&text, &alpha, 0, true, false, false),
+            Some((0, 5))
+        );
+        assert_eq!(
+            find_utf16(&text, &alpha, 6, true, false, false),
+            Some((11, 16))
+        );
+        assert_eq!(
+            find_utf16(&text, &alpha, 11, false, false, false),
+            Some((0, 5))
+        );
+        assert_eq!(
+            find_utf16(&text, &alpha, 0, false, false, false),
+            Some((17, 22))
+        );
+        assert_eq!(
+            find_utf16(&text, &alpha, 0, true, true, false),
+            Some((17, 22))
+        );
+        assert_eq!(find_utf16(&text, &alpha, 0, true, true, true), None);
+        assert_eq!(
+            find_utf16(&text, &alpha, 17, true, false, true),
+            Some((0, 5))
+        );
+    }
+
+    #[test]
+    fn table_columns_fit_the_available_width_and_preserve_emphasis() {
+        let widths = fit_column_widths(&[50.0, 300.0, 80.0], 360.0);
+        assert!((widths.iter().sum::<f32>() - 360.0).abs() < 0.01);
+        assert!(widths[1] > widths[0]);
+        assert!(widths[1] > widths[2]);
+
+        let narrow = fit_column_widths(&[50.0, 300.0, 80.0], 60.0);
+        assert!((narrow.iter().sum::<f32>() - 60.0).abs() < 0.01);
+        assert!(narrow.iter().all(|width| *width > 0.0));
+    }
+
+    #[test]
+    fn markdown_table_uses_shared_columns_and_tab_separated_copy_text() {
+        let document = crate::markdown::parse(
+            "| 軸 | タグ | 対象 | 灯数 |\n| --- | --- | --- | ---: |\n| 灯種 | BEAM | 全ムービングビーム | 164 |\n| 大分類 | ARCH | 門型アーチ全灯 | 80 |",
+        );
+        let renderer = Renderer::new().unwrap();
+        let layout = renderer.layout(&document, 900.0).unwrap();
+
+        assert_eq!(layout.blocks.len(), 3);
+        assert!(layout.blocks.iter().all(|block| block.layout.is_none()));
+        assert!(
+            layout
+                .blocks
+                .iter()
+                .all(|block| block.table_cells.len() == 4)
+        );
+        for column in 0..4 {
+            let x = layout.blocks[0].table_cells[column].x;
+            assert!(
+                layout
+                    .blocks
+                    .iter()
+                    .all(|block| (block.table_cells[column].x - x).abs() < 0.01)
+            );
+        }
+
+        let first = &layout.blocks[0];
+        let copied = String::from_utf16(
+            &layout.selected_text(first.text_start, first.text_start + first.text_len),
+        )
+        .unwrap();
+        assert_eq!(copied, "軸\tタグ\t対象\t灯数");
+    }
+
+    #[test]
     fn long_tokens_wrap_inside_the_document_width() {
         let document = crate::markdown::parse(&"A".repeat(512));
         let renderer = Renderer::new().unwrap();
@@ -809,6 +1361,18 @@ mod tests {
         }
         assert!(metrics.lineCount > 1);
         assert!(metrics.widthIncludingTrailingWhitespace <= block.width + 0.5);
+    }
+
+    #[test]
+    fn a_single_code_block_can_exceed_the_layout_box_height() {
+        let markdown = format!("```text\n{}```", "line\n".repeat(8_000));
+        let document = crate::markdown::parse(&markdown);
+        let renderer = Renderer::new().unwrap();
+        let layout = renderer.layout(&document, 900.0).unwrap();
+        let block = &layout.blocks[0];
+        let lines = line_metrics(block.layout.as_ref().unwrap()).unwrap();
+        assert!(lines.len() >= 8_000);
+        assert!(block.height > TEXT_LAYOUT_BOX_HEIGHT);
     }
 
     #[test]

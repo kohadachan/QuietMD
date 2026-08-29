@@ -21,9 +21,11 @@ use windows::Win32::System::DataExchange::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
+use windows::Win32::System::Ole::CF_UNICODETEXT;
 use windows::Win32::UI::Controls::Dialogs::{
-    GetOpenFileNameW, OFN_DONTADDTORECENT, OFN_EXPLORER, OFN_FILEMUSTEXIST, OFN_HIDEREADONLY,
-    OFN_NOCHANGEDIR, OFN_PATHMUSTEXIST, OPENFILENAMEW,
+    FINDMSGSTRINGW, FINDREPLACE_FLAGS, FINDREPLACEW, FR_DIALOGTERM, FR_DOWN, FR_FINDNEXT,
+    FR_MATCHCASE, FR_WHOLEWORD, FindTextW, GetOpenFileNameW, OFN_DONTADDTORECENT, OFN_EXPLORER,
+    OFN_FILEMUSTEXIST, OFN_HIDEREADONLY, OFN_NOCHANGEDIR, OFN_PATHMUSTEXIST, OPENFILENAMEW,
 };
 use windows::Win32::UI::Controls::SetScrollInfo;
 use windows::Win32::UI::HiDpi::{
@@ -31,23 +33,25 @@ use windows::Win32::UI::HiDpi::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, ReleaseCapture, SetCapture, SetFocus, VK_A, VK_C, VK_CONTROL, VK_DOWN, VK_END,
-    VK_ESCAPE, VK_F5, VK_HOME, VK_NEXT, VK_O, VK_OEM_COMMA, VK_PRIOR, VK_Q, VK_SHIFT, VK_SPACE,
-    VK_UP, VK_W,
+    VK_ESCAPE, VK_F, VK_F3, VK_F5, VK_HOME, VK_NEXT, VK_O, VK_OEM_COMMA, VK_PRIOR, VK_Q, VK_SHIFT,
+    VK_SPACE, VK_UP, VK_W,
 };
 use windows::Win32::UI::Shell::{DragAcceptFiles, DragFinish, DragQueryFileW, HDROP};
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreatePopupMenu,
     CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow, DispatchMessageW, GWLP_USERDATA,
-    GetClientRect, GetCursorPos, GetMessageW, GetScrollInfo, HMENU, IDC_IBEAM, LoadCursorW,
-    LoadIconW, MB_ICONERROR, MB_OK, MF_CHECKED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG,
-    MessageBoxW, PostQuitMessage, RegisterClassExW, SB_BOTTOM, SB_LINEDOWN, SB_LINEUP, SB_PAGEDOWN,
+    GetClientRect, GetCursorPos, GetMessageW, GetScrollInfo, HMENU, IDC_IBEAM, IsDialogMessageW,
+    KillTimer, LoadCursorW, LoadIconW, MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MF_CHECKED,
+    MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG, MessageBoxW, PostQuitMessage,
+    RegisterClassExW, RegisterWindowMessageW, SB_BOTTOM, SB_LINEDOWN, SB_LINEUP, SB_PAGEDOWN,
     SB_PAGEUP, SB_THUMBPOSITION, SB_THUMBTRACK, SB_TOP, SB_VERT, SCROLLINFO, SIF_PAGE, SIF_POS,
-    SIF_RANGE, SIF_TRACKPOS, SW_RESTORE, SW_SHOWDEFAULT, SWP_NOACTIVATE, SWP_NOZORDER, SetTimer,
-    SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON,
-    TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE, WM_CONTEXTMENU, WM_CREATE, WM_DESTROY,
-    WM_DPICHANGED, WM_DROPFILES, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_SIZE,
-    WM_TIMER, WM_VSCROLL, WNDCLASSEXW, WS_OVERLAPPEDWINDOW, WS_VSCROLL,
+    SIF_RANGE, SIF_TRACKPOS, SIZE_MINIMIZED, SW_RESTORE, SW_SHOWDEFAULT, SWP_NOACTIVATE,
+    SWP_NOZORDER, SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, SetWindowTextW,
+    ShowWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE,
+    WM_CONTEXTMENU, WM_CREATE, WM_DESTROY, WM_DPICHANGED, WM_DROPFILES, WM_ERASEBKGND, WM_KEYDOWN,
+    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE,
+    WM_NCDESTROY, WM_PAINT, WM_SIZE, WM_TIMER, WM_VSCROLL, WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
+    WS_VSCROLL,
 };
 use windows::core::{PCWSTR, PWSTR, w};
 
@@ -56,12 +60,19 @@ const DEFAULT_DPI: u32 = 96;
 const INITIAL_WINDOW_WIDTH: i32 = 1000;
 const INITIAL_WINDOW_HEIGHT: i32 = 900;
 const RELOAD_TIMER: usize = 1;
+const RELAYOUT_TIMER: usize = 2;
+const RELAYOUT_DELAY_MS: u32 = 100;
+// winresource's application icon ID, also set explicitly in build.rs.
+const APP_ICON_RESOURCE_ID: usize = 1;
+const FIND_BUFFER_LENGTH: usize = 512;
+const FONT_SIZES: [u8; 6] = [11, 13, 15, 17, 19, 21];
 const MAX_FILE_SIZE: u64 = 32 * 1024 * 1024;
 const EMPTY_DOCUMENT_MARKDOWN: &str =
     "# Open Markdown\n\nDrop a file here\n\nCtrl+O to browse / right-click for menu";
 const CMD_COPY: u32 = 901;
 const CMD_SELECT_ALL: u32 = 902;
 const CMD_CLEAR_SELECTION: u32 = 903;
+const CMD_FIND: u32 = 904;
 const CMD_FONT_BIZ_UD_GOTHIC: u32 = 1000;
 const CMD_FONT_SEGOE_UI: u32 = 1001;
 const CMD_FONT_YU_GOTHIC_UI: u32 = 1002;
@@ -105,10 +116,16 @@ struct AppState {
     selection_anchor: Option<u32>,
     selection_active: Option<u32>,
     selecting: bool,
+    find_message: u32,
+    find_dialog: Option<HWND>,
+    find_request: FINDREPLACEW,
+    find_buffer: [u16; FIND_BUFFER_LENGTH],
+    find_options: u32,
+    zoom_wheel_delta: i32,
 }
 
 impl AppState {
-    fn new(initial_path: Option<PathBuf>) -> Result<Self, String> {
+    fn new(initial_path: Option<PathBuf>, find_message: u32) -> Result<Self, String> {
         let renderer = Renderer::new().map_err(|error| error.to_string())?;
         let mut state = Self {
             renderer,
@@ -123,14 +140,35 @@ impl AppState {
             selection_anchor: None,
             selection_active: None,
             selecting: false,
+            find_message,
+            find_dialog: None,
+            find_request: FINDREPLACEW::default(),
+            find_buffer: [0; FIND_BUFFER_LENGTH],
+            find_options: FR_DOWN.0,
+            zoom_wheel_delta: 0,
         };
         if let Some(path) = initial_path {
-            state.load_path(path)?;
+            state.load_path(path, false)?;
         }
         Ok(state)
     }
 
-    fn load_path(&mut self, path: PathBuf) -> Result<(), String> {
+    fn load_path(&mut self, path: PathBuf, preserve_view: bool) -> Result<(), String> {
+        let previous_scroll = self.scroll_y;
+        let previous_selection = if preserve_view {
+            self.selection_range().and_then(|(anchor, active)| {
+                self.layout.as_ref().map(|layout| {
+                    let (start, end) = if anchor <= active {
+                        (anchor, active)
+                    } else {
+                        (active, anchor)
+                    };
+                    (start, end, layout.selected_text(start, end))
+                })
+            })
+        } else {
+            None
+        };
         let metadata = std::fs::metadata(&path)
             .map_err(|error| format!("Could not inspect the file.\n\n{error}"))?;
         if metadata.len() > MAX_FILE_SIZE {
@@ -142,17 +180,32 @@ impl AppState {
         self.document = markdown::parse(&text);
         self.modified = metadata.modified().ok();
         self.path = Some(path);
-        self.scroll_y = 0.0;
         self.selection_anchor = None;
         self.selection_active = None;
         self.selecting = false;
         self.relayout();
+        if preserve_view {
+            self.scroll_y = previous_scroll.clamp(0.0, self.max_scroll());
+            if let (Some((start, end, selected)), Some(layout)) =
+                (previous_selection, self.layout.as_ref())
+                && end <= layout.text_len()
+                && layout.selected_text(start, end) == selected
+            {
+                self.selection_anchor = Some(start);
+                self.selection_active = Some(end);
+            }
+        } else {
+            self.scroll_y = 0.0;
+        }
         Ok(())
     }
 
     fn open_path(&mut self, hwnd: HWND, path: PathBuf) {
-        match self.load_path(path) {
+        match self.load_path(path, false) {
             Ok(()) => {
+                unsafe {
+                    SetTimer(Some(hwnd), RELOAD_TIMER, 1000, None);
+                }
                 self.update_title(hwnd);
                 self.update_scrollbar(hwnd);
                 unsafe {
@@ -175,15 +228,33 @@ impl AppState {
                 return;
             }
         }
-        self.open_path(hwnd, path);
+        match self.load_path(path, true) {
+            Ok(()) => {
+                self.update_title(hwnd);
+                self.update_scrollbar(hwnd);
+                unsafe {
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
+            }
+            Err(message) => show_error(Some(hwnd), &message),
+        }
     }
 
     fn resize(&mut self, hwnd: HWND, width: u32, height: u32) {
+        self.resize_surface(width, height);
+        self.relayout();
+        self.set_scroll(hwnd, self.scroll_y);
+    }
+
+    fn resize_surface(&mut self, width: u32, height: u32) {
         self.client_width_px = width.max(1);
         self.client_height_px = height.max(1);
         let _ = self
             .renderer
             .resize(self.client_width_px, self.client_height_px);
+    }
+
+    fn finish_deferred_resize(&mut self, hwnd: HWND) {
         self.relayout();
         self.set_scroll(hwnd, self.scroll_y);
     }
@@ -328,6 +399,154 @@ impl AppState {
         }
     }
 
+    fn apply_view_settings(&mut self, hwnd: HWND, settings: ViewSettings) {
+        if settings == self.renderer.settings() {
+            return;
+        }
+        if let Err(error) = self.renderer.set_settings(settings) {
+            show_error(
+                Some(hwnd),
+                &format!("Could not apply display settings.\n\n{error}"),
+            );
+            return;
+        }
+        self.relayout();
+        self.set_scroll(hwnd, self.scroll_y);
+    }
+
+    fn adjust_text_size_from_wheel(&mut self, hwnd: HWND, delta: i32) {
+        self.zoom_wheel_delta += delta;
+        let steps = self.zoom_wheel_delta / 120;
+        self.zoom_wheel_delta %= 120;
+        if steps == 0 {
+            return;
+        }
+        let current = self.renderer.settings();
+        let mut next = current;
+        next.font_size = stepped_font_size(current.font_size, steps);
+        self.apply_view_settings(hwnd, next);
+    }
+
+    fn show_find_dialog(&mut self, hwnd: HWND) {
+        if let Some(dialog) = self.find_dialog {
+            unsafe {
+                let _ = SetForegroundWindow(dialog);
+            }
+            return;
+        }
+
+        self.find_request = FINDREPLACEW {
+            lStructSize: size_of::<FINDREPLACEW>() as u32,
+            hwndOwner: hwnd,
+            Flags: FINDREPLACE_FLAGS(self.find_options),
+            lpstrFindWhat: PWSTR(self.find_buffer.as_mut_ptr()),
+            wFindWhatLen: FIND_BUFFER_LENGTH as u16,
+            ..Default::default()
+        };
+        let dialog = unsafe { FindTextW(&mut self.find_request) };
+        if dialog.0.is_null() {
+            show_error(Some(hwnd), "Could not open Find.");
+            return;
+        }
+        self.find_dialog = Some(dialog);
+    }
+
+    fn handle_find_message(&mut self, hwnd: HWND) {
+        let flags = self.find_request.Flags;
+        if flags.contains(FR_DIALOGTERM) {
+            self.find_dialog = None;
+            return;
+        }
+        if !flags.contains(FR_FINDNEXT) {
+            return;
+        }
+        self.find_options = flags.0 & (FR_DOWN.0 | FR_MATCHCASE.0 | FR_WHOLEWORD.0);
+        self.find_next(
+            hwnd,
+            flags.contains(FR_DOWN),
+            flags.contains(FR_MATCHCASE),
+            flags.contains(FR_WHOLEWORD),
+        );
+    }
+
+    fn repeat_find(&mut self, hwnd: HWND, reverse: bool) {
+        if self.find_buffer.first() == Some(&0) {
+            self.show_find_dialog(hwnd);
+            return;
+        }
+        let default_forward = self.find_options & FR_DOWN.0 != 0;
+        self.find_next(
+            hwnd,
+            if reverse {
+                !default_forward
+            } else {
+                default_forward
+            },
+            self.find_options & FR_MATCHCASE.0 != 0,
+            self.find_options & FR_WHOLEWORD.0 != 0,
+        );
+    }
+
+    fn find_next(&mut self, hwnd: HWND, forward: bool, match_case: bool, whole_word: bool) {
+        let query_length = self
+            .find_buffer
+            .iter()
+            .position(|value| *value == 0)
+            .unwrap_or(self.find_buffer.len());
+        if query_length == 0 {
+            return;
+        }
+        let start = self
+            .selection_range()
+            .map(|(anchor, active)| {
+                if forward {
+                    anchor.max(active)
+                } else {
+                    anchor.min(active)
+                }
+            })
+            .unwrap_or_else(|| {
+                if forward {
+                    0
+                } else {
+                    self.layout
+                        .as_ref()
+                        .map(LayoutDocument::text_len)
+                        .unwrap_or(0)
+                }
+            });
+        let found = self.layout.as_ref().and_then(|layout| {
+            let range = layout.find_text(
+                &self.find_buffer[..query_length],
+                start,
+                forward,
+                match_case,
+                whole_word,
+            )?;
+            let vertical = layout.vertical_range_for_position(range.0).ok().flatten();
+            Some((range, vertical))
+        });
+        let Some(((start, end), vertical)) = found else {
+            let query = String::from_utf16_lossy(&self.find_buffer[..query_length]);
+            show_information(Some(hwnd), &format!("Cannot find “{query}”."));
+            return;
+        };
+
+        self.selection_anchor = Some(start);
+        self.selection_active = Some(end);
+        self.selecting = false;
+        let mut next_scroll = self.scroll_y;
+        if let Some((top, bottom)) = vertical {
+            let margin = 20.0;
+            if top < self.scroll_y + margin {
+                next_scroll = (top - margin).max(0.0);
+            } else if bottom > self.scroll_y + self.client_height_dip() - margin {
+                next_scroll = bottom - self.client_height_dip() + margin;
+            }
+        }
+        self.set_scroll(hwnd, next_scroll);
+    }
+
     fn update_scrollbar(&self, hwnd: HWND) {
         let info = SCROLLINFO {
             cbSize: size_of::<SCROLLINFO>() as u32,
@@ -406,6 +625,10 @@ fn run() -> Result<(), String> {
         return Ok(());
     }
     let initial_path = args.first().map(PathBuf::from);
+    let find_message = unsafe { RegisterWindowMessageW(FINDMSGSTRINGW) };
+    if find_message == 0 {
+        return Err("Could not register the Find message.".to_string());
+    }
 
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -414,8 +637,13 @@ fn run() -> Result<(), String> {
     let hmodule = unsafe { GetModuleHandleW(None) }.map_err(|error| error.to_string())?;
     let hinstance = hmodule.into();
     let cursor = unsafe { LoadCursorW(None, IDC_IBEAM) }.map_err(|error| error.to_string())?;
-    let icon = unsafe { LoadIconW(Some(hinstance), PCWSTR(std::ptr::without_provenance(1))) }
-        .map_err(|error| error.to_string())?;
+    let icon = unsafe {
+        LoadIconW(
+            Some(hinstance),
+            PCWSTR(std::ptr::without_provenance(APP_ICON_RESOURCE_ID)),
+        )
+    }
+    .map_err(|error| error.to_string())?;
     let class = WNDCLASSEXW {
         cbSize: size_of::<WNDCLASSEXW>() as u32,
         style: CS_DBLCLKS | CS_HREDRAW | CS_VREDRAW,
@@ -431,8 +659,8 @@ fn run() -> Result<(), String> {
         return Err("Could not register the window class.".to_string());
     }
 
-    let state = Box::new(AppState::new(initial_path)?);
-    let state_ptr = Box::into_raw(state);
+    let mut state = Box::new(AppState::new(initial_path, find_message)?);
+    let state_ptr = std::ptr::from_mut(state.as_mut());
     let hwnd = unsafe {
         CreateWindowExW(
             WINDOW_EX_STYLE::default(),
@@ -458,6 +686,12 @@ fn run() -> Result<(), String> {
 
     let mut message = MSG::default();
     while unsafe { GetMessageW(&mut message, None, 0, 0) }.as_bool() {
+        let find_dialog = state.find_dialog;
+        if let Some(dialog) = find_dialog
+            && unsafe { IsDialogMessageW(dialog, &message) }.as_bool()
+        {
+            continue;
+        }
         unsafe {
             let _ = TranslateMessage(&message);
             DispatchMessageW(&message);
@@ -477,21 +711,35 @@ unsafe extern "system" fn window_proc(
         unsafe {
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, create.lpCreateParams as isize);
         }
-        return LRESULT(1);
+        return unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
     }
 
     let state_ptr =
         unsafe { windows::Win32::UI::WindowsAndMessaging::GetWindowLongPtrW(hwnd, GWLP_USERDATA) }
             as *mut AppState;
-    let state = unsafe { state_ptr.as_mut() };
+    let mut state = unsafe { state_ptr.as_mut() };
+
+    if state
+        .as_ref()
+        .is_some_and(|state| message == state.find_message)
+    {
+        if let Some(state) = state.as_deref_mut() {
+            state.handle_find_message(hwnd);
+        }
+        return LRESULT(0);
+    }
 
     match message {
         WM_CREATE => {
             unsafe {
                 DragAcceptFiles(hwnd, true);
-                SetTimer(Some(hwnd), RELOAD_TIMER, 1000, None);
             }
             if let Some(state) = state {
+                if state.path.is_some() {
+                    unsafe {
+                        SetTimer(Some(hwnd), RELOAD_TIMER, 1000, None);
+                    }
+                }
                 state.set_dpi(unsafe { GetDpiForWindow(hwnd) });
                 let mut rect = RECT::default();
                 if unsafe { GetClientRect(hwnd, &mut rect) }.is_ok() {
@@ -524,13 +772,17 @@ unsafe extern "system" fn window_proc(
             LRESULT(0)
         }
         WM_SIZE => {
-            if let Some(state) = state {
+            if wparam.0 as u32 != SIZE_MINIMIZED
+                && let Some(state) = state
+            {
                 let packed = lparam.0 as usize;
-                state.resize(
-                    hwnd,
+                state.resize_surface(
                     (packed & 0xffff).max(1) as u32,
                     ((packed >> 16) & 0xffff).max(1) as u32,
                 );
+                unsafe {
+                    SetTimer(Some(hwnd), RELAYOUT_TIMER, RELAYOUT_DELAY_MS, None);
+                }
             }
             LRESULT(0)
         }
@@ -578,8 +830,14 @@ unsafe extern "system" fn window_proc(
         }
         WM_MOUSEWHEEL => {
             if let Some(state) = state {
-                let delta = ((wparam.0 >> 16) & 0xffff) as u16 as i16 as f32;
-                state.set_scroll(hwnd, state.scroll_y - delta * 64.0 / 120.0);
+                let delta = ((wparam.0 >> 16) & 0xffff) as u16 as i16 as i32;
+                let control = unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0;
+                if control {
+                    state.adjust_text_size_from_wheel(hwnd, delta);
+                } else {
+                    state.zoom_wheel_delta = 0;
+                    state.set_scroll(hwnd, state.scroll_y - delta as f32 * 64.0 / 120.0);
+                }
             }
             LRESULT(0)
         }
@@ -636,6 +894,10 @@ unsafe extern "system" fn window_proc(
                     }
                     return LRESULT(0);
                 }
+                if control && key == VK_F.0 {
+                    state.show_find_dialog(hwnd);
+                    return LRESULT(0);
+                }
                 if control && key == VK_OEM_COMMA.0 {
                     show_context_menu(hwnd, state);
                     return LRESULT(0);
@@ -652,6 +914,10 @@ unsafe extern "system" fn window_proc(
                 }
                 if key == VK_F5.0 {
                     state.reload(hwnd, false);
+                    return LRESULT(0);
+                }
+                if key == VK_F3.0 {
+                    state.repeat_find(hwnd, shift);
                     return LRESULT(0);
                 }
                 let next = if key == VK_UP.0 {
@@ -706,11 +972,20 @@ unsafe extern "system" fn window_proc(
                 && let Some(state) = state
             {
                 state.reload(hwnd, true);
+            } else if wparam.0 == RELAYOUT_TIMER {
+                unsafe {
+                    let _ = KillTimer(Some(hwnd), RELAYOUT_TIMER);
+                }
+                if let Some(state) = state {
+                    state.finish_deferred_resize(hwnd);
+                }
             }
             LRESULT(0)
         }
         WM_DESTROY => {
             unsafe {
+                let _ = KillTimer(Some(hwnd), RELOAD_TIMER);
+                let _ = KillTimer(Some(hwnd), RELAYOUT_TIMER);
                 PostQuitMessage(0);
             }
             LRESULT(0)
@@ -719,7 +994,6 @@ unsafe extern "system" fn window_proc(
             if !state_ptr.is_null() {
                 unsafe {
                     SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
-                    drop(Box::from_raw(state_ptr));
                 }
             }
             unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
@@ -794,6 +1068,10 @@ fn show_context_menu(hwnd: HWND, state: &mut AppState) {
         .layout
         .as_ref()
         .is_some_and(|layout| layout.text_len() > 0);
+    append_action_item(menu, CMD_FIND, "Find…\tCtrl+F", has_text);
+    unsafe {
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+    }
     append_action_item(menu, CMD_COPY, "Copy\tCtrl+C", has_selection);
     append_action_item(menu, CMD_SELECT_ALL, "Select all\tCtrl+A", has_text);
     append_action_item(
@@ -915,6 +1193,10 @@ fn show_context_menu(hwnd: HWND, state: &mut AppState) {
     }
 
     match command {
+        CMD_FIND => {
+            state.show_find_dialog(hwnd);
+            return;
+        }
         CMD_COPY => {
             state.copy_selection(hwnd);
             return;
@@ -940,15 +1222,7 @@ fn show_context_menu(hwnd: HWND, state: &mut AppState) {
     let Some(next) = settings_for_command(settings, command) else {
         return;
     };
-    if let Err(error) = state.renderer.set_settings(next) {
-        show_error(
-            Some(hwnd),
-            &format!("Could not apply display settings.\n\n{error}"),
-        );
-        return;
-    }
-    state.relayout();
-    state.set_scroll(hwnd, state.scroll_y);
+    state.apply_view_settings(hwnd, next);
 }
 
 fn append_action_item(menu: HMENU, command: u32, label: &str, enabled: bool) {
@@ -1075,6 +1349,22 @@ fn space_page_direction(control: bool, shift: bool, key: u16) -> Option<bool> {
     (!control && key == VK_SPACE.0).then_some(shift)
 }
 
+fn stepped_font_size(current: u8, steps: i32) -> u8 {
+    let current_index = FONT_SIZES
+        .iter()
+        .position(|size| *size == current)
+        .unwrap_or_else(|| {
+            FONT_SIZES
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, size)| size.abs_diff(current))
+                .map(|(index, _)| index)
+                .unwrap_or(0)
+        });
+    let next_index = (current_index as i32 + steps).clamp(0, FONT_SIZES.len() as i32 - 1);
+    FONT_SIZES[next_index as usize]
+}
+
 fn normalized_dpi(dpi: u32) -> u32 {
     if dpi == 0 { DEFAULT_DPI } else { dpi }
 }
@@ -1106,7 +1396,7 @@ fn copy_utf16_to_clipboard(hwnd: HWND, text: &[u16]) -> Result<(), String> {
             }
             std::ptr::copy_nonoverlapping(payload.as_ptr(), destination, payload.len());
             let _ = GlobalUnlock(memory);
-            if let Err(error) = SetClipboardData(13, Some(HANDLE(memory.0))) {
+            if let Err(error) = SetClipboardData(CF_UNICODETEXT.0 as u32, Some(HANDLE(memory.0))) {
                 let _ = GlobalFree(Some(memory));
                 return Err(format!("Could not write to the clipboard.\n\n{error}"));
             }
@@ -1143,10 +1433,9 @@ fn decode_text(bytes: Vec<u8>) -> Result<String, String> {
     if bytes.starts_with(&[0xfe, 0xff]) {
         return decode_utf16(&bytes[2..], false);
     }
-    match String::from_utf8(bytes) {
-        Ok(value) => Ok(value),
-        Err(error) => Ok(String::from_utf8_lossy(error.as_bytes()).into_owned()),
-    }
+    String::from_utf8(bytes).map_err(|_| {
+        "Unsupported text encoding. Save the file as UTF-8 or UTF-16 with a BOM.".to_string()
+    })
 }
 
 fn decode_utf16(bytes: &[u8], little_endian: bool) -> Result<String, String> {
@@ -1178,6 +1467,18 @@ fn show_error(hwnd: Option<HWND>, message: &str) {
     }
 }
 
+fn show_information(hwnd: Option<HWND>, message: &str) {
+    let message = wide_null(message);
+    unsafe {
+        MessageBoxW(
+            hwnd,
+            PCWSTR(message.as_ptr()),
+            w!("QuietMD"),
+            MB_OK | MB_ICONINFORMATION,
+        );
+    }
+}
+
 fn wide_null(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(Some(0)).collect()
 }
@@ -1192,10 +1493,68 @@ fn window_title(path: Option<&Path>) -> String {
 mod tests {
     use super::*;
 
+    struct TempFile(PathBuf);
+
+    impl Drop for TempFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn temporary_markdown_path() -> TempFile {
+        let unique = format!(
+            "quietmd-test-{}-{}.md",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        TempFile(std::env::temp_dir().join(unique))
+    }
+
     #[test]
     fn decodes_utf8_and_bom() {
         assert_eq!(decode_text("日本語".as_bytes().to_vec()).unwrap(), "日本語");
         assert_eq!(decode_text(vec![0xef, 0xbb, 0xbf, b'a']).unwrap(), "a");
+    }
+
+    #[test]
+    fn rejects_unknown_text_encoding_instead_of_replacing_characters() {
+        let error = decode_text(vec![0x82, 0xa0]).unwrap_err();
+        assert!(error.contains("Unsupported text encoding"));
+    }
+
+    #[test]
+    fn reload_preserves_scroll_and_only_keeps_unchanged_selection() {
+        let path = temporary_markdown_path();
+        let text = (0..300)
+            .map(|index| format!("Paragraph {index}: searchable marker text."))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        std::fs::write(&path.0, &text).unwrap();
+
+        let mut state = AppState::new(None, 1).unwrap();
+        state.load_path(path.0.clone(), false).unwrap();
+        let marker = "searchable marker".encode_utf16().collect::<Vec<_>>();
+        let selection = state
+            .layout
+            .as_ref()
+            .unwrap()
+            .find_text(&marker, 0, true, true, false)
+            .unwrap();
+        state.selection_anchor = Some(selection.0);
+        state.selection_active = Some(selection.1);
+        state.scroll_y = 240.0;
+
+        state.load_path(path.0.clone(), true).unwrap();
+        assert_eq!(state.scroll_y, 240.0);
+        assert_eq!(state.selection_range(), Some(selection));
+
+        std::fs::write(&path.0, format!("Inserted before the document.\n\n{text}")).unwrap();
+        state.load_path(path.0.clone(), true).unwrap();
+        assert_eq!(state.scroll_y, 240.0);
+        assert_eq!(state.selection_range(), None);
     }
 
     #[test]
@@ -1237,6 +1596,14 @@ mod tests {
             settings_for_command(relaxed, CMD_SETTINGS_RESET),
             Some(ViewSettings::default())
         );
+    }
+
+    #[test]
+    fn steps_and_clamps_wheel_font_sizes() {
+        assert_eq!(stepped_font_size(15, 1), 17);
+        assert_eq!(stepped_font_size(15, -2), 11);
+        assert_eq!(stepped_font_size(21, 3), 21);
+        assert_eq!(stepped_font_size(11, -1), 11);
     }
 
     #[test]

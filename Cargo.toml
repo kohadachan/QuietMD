@@ -3,6 +3,7 @@ name = "quietmd"
 version = "0.1.0"
 edition = "2024"
 description = "A minimal, read-only native Markdown viewer for Windows"
+license = "MIT"
 
 [dependencies]
 pulldown-cmark = { version = "0.13.4", default-features = false }
@@ -17,6 +18,7 @@ windows = { version = "0.61.3", features = [
     "Win32_System_DataExchange",
     "Win32_System_LibraryLoader",
     "Win32_System_Memory",
+    "Win32_System_Ole",
     "Win32_UI_Controls",
     "Win32_UI_Controls_Dialogs",
     "Win32_UI_HiDpi",
