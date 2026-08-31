@@ -39,7 +39,7 @@ Run `QuietMD.exe`, then drop a Markdown file onto the window. You can also drop 
 | Select text | Mouse drag |
 | Select one sentence | Double-click |
 | Copy / Select all | `Ctrl+C` / `Ctrl+A` |
-| Search selected text on the web | Right-click → `Webで検索` |
+| Search selected text on the web | Right-click → `Search the web` |
 | Find / Find next / Find previous | `Ctrl+F` / `F3` / `Shift+F3` |
 | Clear selection | `Esc` |
 | Open the context menu | Right-click or `Ctrl+,` |
@@ -81,7 +81,7 @@ QuietMDは、Markdownを安全に読むことだけに特化した、超軽量�
 - 設定ファイル、履歴、キャッシュ、レジストリ、AppData、通信、テレメトリなし
 - ウィンドウ幅に追従する折り返しと、モニターごとのDPIに対応
 - ドラッグ選択、ダブルクリックによるセンテンス全体の選択、コピーに対応
-- 選択文字列を右クリックの「Webで検索」から既定ブラウザでGoogle検索
+- 選択文字列を右クリックの「Search the web」から既定ブラウザでGoogle検索
 - `Ctrl+F`、`F3`、`Shift+F3`による前後検索
 - フォント、文字サイズ、行間をセッション中だけ変更可能
 - `Ctrl+マウスホイール`で文字サイズを変更

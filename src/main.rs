@@ -1093,7 +1093,7 @@ fn show_context_menu(hwnd: HWND, state: &mut AppState) {
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
     }
     append_action_item(menu, CMD_COPY, "Copy\tCtrl+C", has_selection);
-    append_action_item(menu, CMD_SEARCH_WEB, "Webで検索", has_selection);
+    append_action_item(menu, CMD_SEARCH_WEB, "Search the web", has_selection);
     append_action_item(menu, CMD_SELECT_ALL, "Select all\tCtrl+A", has_text);
     append_action_item(
         menu,
