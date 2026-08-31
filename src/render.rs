@@ -9,13 +9,15 @@ use windows::Win32::Graphics::Direct2D::{
     D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_RENDER_TARGET_USAGE_NONE, D2D1CreateFactory,
     ID2D1Factory, ID2D1HwndRenderTarget, ID2D1SolidColorBrush,
 };
+#[cfg(test)]
+use windows::Win32::Graphics::DirectWrite::DWRITE_LINE_METRICS;
 use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_ITALIC,
     DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_WEIGHT_NORMAL,
-    DWRITE_HIT_TEST_METRICS, DWRITE_LINE_METRICS, DWRITE_LINE_SPACING_METHOD_UNIFORM,
-    DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_TEXT_ALIGNMENT_TRAILING,
-    DWRITE_TEXT_METRICS, DWRITE_TEXT_RANGE, DWRITE_WORD_WRAPPING_EMERGENCY_BREAK,
-    DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, IDWriteTextLayout,
+    DWRITE_HIT_TEST_METRICS, DWRITE_LINE_SPACING_METHOD_UNIFORM, DWRITE_TEXT_ALIGNMENT_CENTER,
+    DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_TEXT_ALIGNMENT_TRAILING, DWRITE_TEXT_METRICS,
+    DWRITE_TEXT_RANGE, DWRITE_WORD_WRAPPING_EMERGENCY_BREAK, DWriteCreateFactory, IDWriteFactory,
+    IDWriteTextFormat, IDWriteTextLayout,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_UNKNOWN;
 use windows::core::{PCWSTR, Result, w};
@@ -501,31 +503,52 @@ impl Renderer {
         Ok(document.text_len())
     }
 
-    pub fn line_range_at(&self, document: &LayoutDocument, y: f32) -> Result<Option<(u32, u32)>> {
+    pub fn sentence_range_at(
+        &self,
+        document: &LayoutDocument,
+        x: f32,
+        y: f32,
+    ) -> Result<Option<(u32, u32)>> {
         for block in &document.blocks {
             if y < block.y || y > block.y + block.height {
                 continue;
             }
-            if !block.table_cells.is_empty() {
-                return Ok(Some((block.text_start, block.text_start + block.text_len)));
-            }
-            let Some(text_layout) = block.layout.as_ref() else {
-                return Ok(None);
-            };
-            let lines = line_metrics(text_layout)?;
-            let mut line_top = block.y;
-            let mut local_start = 0u32;
-            for (index, line) in lines.iter().enumerate() {
-                let is_last = index + 1 == lines.len();
-                if y <= line_top + line.height || is_last {
-                    let visible_length = line.length.saturating_sub(line.newlineLength);
-                    let start = block.text_start + local_start;
-                    return Ok(Some((start, start + visible_length)));
+
+            let (text_start, text_len, character_position) = if !block.table_cells.is_empty() {
+                let Some(cell) = block
+                    .table_cells
+                    .iter()
+                    .find(|cell| x < cell.x + cell.width + TABLE_CELL_PADDING_X)
+                    .or_else(|| block.table_cells.last())
+                else {
+                    return Ok(None);
+                };
+                if cell.text_len == 0 {
+                    return Ok(None);
                 }
-                line_top += line.height;
-                local_start += line.length;
-            }
-            return Ok(None);
+                (
+                    cell.text_start,
+                    cell.text_len,
+                    hit_test_character(&cell.layout, x - cell.x, y - cell.y, cell.text_len)?,
+                )
+            } else {
+                let Some(text_layout) = block.layout.as_ref() else {
+                    return Ok(None);
+                };
+                if block.text_len == 0 {
+                    return Ok(None);
+                }
+                (
+                    block.text_start,
+                    block.text_len,
+                    hit_test_character(text_layout, x - block.x, y - block.y, block.text_len)?,
+                )
+            };
+
+            let text_end = text_start + text_len;
+            let text = &document.plain_text[text_start as usize..text_end as usize];
+            return Ok(sentence_range_utf16(text, character_position)
+                .map(|(start, end)| (text_start + start, text_start + end)));
         }
         Ok(None)
     }
@@ -912,6 +935,7 @@ fn draw_selection(
     Ok(())
 }
 
+#[cfg(test)]
 fn line_metrics(layout: &IDWriteTextLayout) -> Result<Vec<DWRITE_LINE_METRICS>> {
     let mut count = 0u32;
     let first_result = unsafe { layout.GetLineMetrics(None, &mut count) };
@@ -932,6 +956,114 @@ fn normalized_range(anchor: u32, active: u32, text_len: u32) -> (u32, u32) {
     let start = anchor.min(active).min(text_len);
     let end = anchor.max(active).min(text_len);
     (start, end)
+}
+
+fn hit_test_character(layout: &IDWriteTextLayout, x: f32, y: f32, text_len: u32) -> Result<u32> {
+    let mut trailing = windows::core::BOOL::default();
+    let mut inside = windows::core::BOOL::default();
+    let mut metrics = DWRITE_HIT_TEST_METRICS::default();
+    unsafe {
+        layout.HitTestPoint(x, y, &mut trailing, &mut inside, &mut metrics)?;
+    }
+    Ok(metrics.textPosition.min(text_len.saturating_sub(1)))
+}
+
+fn sentence_range_utf16(text: &[u16], position: u32) -> Option<(u32, u32)> {
+    if text.is_empty() {
+        return None;
+    }
+
+    let target = position.min(text.len().saturating_sub(1) as u32) as usize;
+    let mut cursor = 0usize;
+    let mut last_range = None;
+
+    while cursor < text.len() {
+        while cursor < text.len() && is_sentence_whitespace(text[cursor]) {
+            cursor += 1;
+        }
+        if cursor == text.len() {
+            break;
+        }
+
+        let start = cursor;
+        while cursor < text.len() && text[cursor] != '\n' as u16 {
+            if is_sentence_terminal(text, cursor) {
+                cursor += 1;
+                while cursor < text.len() && is_sentence_terminal(text, cursor) {
+                    cursor += 1;
+                }
+                while cursor < text.len() && is_sentence_closer(text[cursor]) {
+                    cursor += 1;
+                }
+                break;
+            }
+            cursor += 1;
+        }
+
+        let mut end = cursor;
+        while end > start && is_sentence_whitespace(text[end - 1]) {
+            end -= 1;
+        }
+        if start < end {
+            let range = (start as u32, end as u32);
+            if target < end {
+                return Some(range);
+            }
+            last_range = Some(range);
+        }
+
+        if cursor < text.len() && text[cursor] == '\n' as u16 {
+            cursor += 1;
+        }
+    }
+
+    last_range
+}
+
+fn is_sentence_terminal(text: &[u16], index: usize) -> bool {
+    match char::from_u32(text[index] as u32) {
+        Some('。' | '！' | '？' | '!' | '?') => true,
+        Some('.') => {
+            let previous = index.checked_sub(1).and_then(|index| text.get(index));
+            let next = text.get(index + 1);
+            !matches!(
+                (previous, next),
+                (Some(previous), Some(next))
+                    if is_ascii_alphanumeric_utf16(*previous)
+                        && is_ascii_alphanumeric_utf16(*next)
+            )
+        }
+        _ => false,
+    }
+}
+
+fn is_ascii_alphanumeric_utf16(value: u16) -> bool {
+    char::from_u32(value as u32).is_some_and(|value| value.is_ascii_alphanumeric())
+}
+
+fn is_sentence_closer(value: u16) -> bool {
+    matches!(
+        char::from_u32(value as u32),
+        Some(
+            '」' | '』'
+                | '）'
+                | '】'
+                | '〕'
+                | '〉'
+                | '》'
+                | '”'
+                | '’'
+                | '"'
+                | '\''
+                | ')'
+                | ']'
+                | '}'
+        )
+    )
+}
+
+fn is_sentence_whitespace(value: u16) -> bool {
+    char::from_u32(value as u32).is_some_and(char::is_whitespace)
 }
 
 #[derive(Clone, Copy)]
@@ -1241,7 +1373,7 @@ mod tests {
     use super::{
         DWRITE_TEXT_METRICS, FontChoice, LineSpacingChoice, PAGE_TOP_PADDING, Renderer,
         TEXT_LAYOUT_BOX_HEIGHT, ViewSettings, find_utf16, fit_column_widths, line_metrics,
-        normalized_range, page_geometry,
+        normalized_range, page_geometry, sentence_range_utf16,
     };
 
     #[test]
@@ -1415,29 +1547,40 @@ mod tests {
     }
 
     #[test]
-    fn finds_the_complete_visual_line_at_a_vertical_position() {
-        let document = crate::markdown::parse(
-            "A visual line that wraps should be selectable independently. \
-             The second visual line must not select the first one.",
+    fn finds_the_sentence_containing_the_clicked_character() {
+        fn selected_sentence(text: &str, marker: &str) -> String {
+            let marker_byte = text.find(marker).unwrap();
+            let position = text[..marker_byte].encode_utf16().count() as u32;
+            let wide = text.encode_utf16().collect::<Vec<_>>();
+            let (start, end) = sentence_range_utf16(&wide, position).unwrap();
+            String::from_utf16(&wide[start as usize..end as usize]).unwrap()
+        }
+
+        let text = "「最初です。」 次の文は表示上で折り返しても一続きです！ 最後です？";
+        assert_eq!(selected_sentence(text, "最初"), "「最初です。」");
+        assert_eq!(
+            selected_sentence(text, "折り返して"),
+            "次の文は表示上で折り返しても一続きです！"
         );
-        let renderer = Renderer::new().unwrap();
-        let layout = renderer.layout(&document, 260.0).unwrap();
-        let block = &layout.blocks[0];
-        let lines = line_metrics(block.layout.as_ref().unwrap()).unwrap();
-        assert!(lines.len() > 1);
+        assert_eq!(selected_sentence(text, "最後"), "最後です？");
+    }
 
-        let first = renderer
-            .line_range_at(&layout, block.y + lines[0].height / 2.0)
-            .unwrap()
-            .unwrap();
-        let second = renderer
-            .line_range_at(&layout, block.y + lines[0].height + lines[1].height / 2.0)
-            .unwrap()
-            .unwrap();
+    #[test]
+    fn keeps_decimal_points_inside_a_sentence_and_stops_at_hard_breaks() {
+        let text = "Version 1.2 is current.\nSecond sentence.";
+        let wide = text.encode_utf16().collect::<Vec<_>>();
+        let decimal_position = text.find("1.2").unwrap() as u32;
+        let second_position = text.find("Second").unwrap() as u32;
 
-        assert_eq!(first.0, block.text_start);
-        assert_eq!(first.1, block.text_start + lines[0].length);
-        assert_eq!(second.0, first.1);
-        assert!(second.1 > second.0);
+        let first = sentence_range_utf16(&wide, decimal_position).unwrap();
+        let second = sentence_range_utf16(&wide, second_position).unwrap();
+        assert_eq!(
+            String::from_utf16(&wide[first.0 as usize..first.1 as usize]).unwrap(),
+            "Version 1.2 is current."
+        );
+        assert_eq!(
+            String::from_utf16(&wide[second.0 as usize..second.1 as usize]).unwrap(),
+            "Second sentence."
+        );
     }
 }

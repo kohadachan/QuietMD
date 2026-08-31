@@ -12,7 +12,8 @@ QuietMD is a single native executable built with Rust, Win32, Direct2D, and Dire
 
 - Portable single-file application; no installer required
 - Responsive word wrapping and per-monitor DPI support
-- Mouse text selection, line selection by double-click, and clipboard copy
+- Mouse text selection, sentence selection by double-click, and clipboard copy
+- Web search for selected text through the default browser
 - Native Find dialog with forward and backward search
 - Configurable font, text size, and line spacing for the current session
 - Measured Markdown table columns with cell wrapping in narrow windows
@@ -36,8 +37,9 @@ Run `QuietMD.exe`, then drop a Markdown file onto the window. You can also drop 
 | --- | --- |
 | Open a file | `Ctrl+O` |
 | Select text | Mouse drag |
-| Select one visual line | Double-click |
+| Select one sentence | Double-click |
 | Copy / Select all | `Ctrl+C` / `Ctrl+A` |
+| Search selected text on the web | Right-click → `Webで検索` |
 | Find / Find next / Find previous | `Ctrl+F` / `F3` / `Shift+F3` |
 | Clear selection | `Esc` |
 | Open the context menu | Right-click or `Ctrl+,` |
@@ -78,7 +80,8 @@ QuietMDは、Markdownを安全に読むことだけに特化した、超軽量�
 - インストール不要の単体EXE
 - 設定ファイル、履歴、キャッシュ、レジストリ、AppData、通信、テレメトリなし
 - ウィンドウ幅に追従する折り返しと、モニターごとのDPIに対応
-- ドラッグ選択、ダブルクリックによる表示行選択、コピーに対応
+- ドラッグ選択、ダブルクリックによるセンテンス全体の選択、コピーに対応
+- 選択文字列を右クリックの「Webで検索」から既定ブラウザでGoogle検索
 - `Ctrl+F`、`F3`、`Shift+F3`による前後検索
 - フォント、文字サイズ、行間をセッション中だけ変更可能
 - `Ctrl+マウスホイール`で文字サイズを変更

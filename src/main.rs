@@ -36,7 +36,9 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_ESCAPE, VK_F, VK_F3, VK_F5, VK_HOME, VK_NEXT, VK_O, VK_OEM_COMMA, VK_PRIOR, VK_Q, VK_SHIFT,
     VK_SPACE, VK_UP, VK_W,
 };
-use windows::Win32::UI::Shell::{DragAcceptFiles, DragFinish, DragQueryFileW, HDROP};
+use windows::Win32::UI::Shell::{
+    DragAcceptFiles, DragFinish, DragQueryFileW, HDROP, ShellExecuteW,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreatePopupMenu,
     CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow, DispatchMessageW, GWLP_USERDATA,
@@ -45,13 +47,13 @@ use windows::Win32::UI::WindowsAndMessaging::{
     MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG, MessageBoxW, PostQuitMessage,
     RegisterClassExW, RegisterWindowMessageW, SB_BOTTOM, SB_LINEDOWN, SB_LINEUP, SB_PAGEDOWN,
     SB_PAGEUP, SB_THUMBPOSITION, SB_THUMBTRACK, SB_TOP, SB_VERT, SCROLLINFO, SIF_PAGE, SIF_POS,
-    SIF_RANGE, SIF_TRACKPOS, SIZE_MINIMIZED, SW_RESTORE, SW_SHOWDEFAULT, SWP_NOACTIVATE,
-    SWP_NOZORDER, SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, SetWindowTextW,
-    ShowWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE,
-    WM_CONTEXTMENU, WM_CREATE, WM_DESTROY, WM_DPICHANGED, WM_DROPFILES, WM_ERASEBKGND, WM_KEYDOWN,
-    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE,
-    WM_NCDESTROY, WM_PAINT, WM_SIZE, WM_TIMER, WM_VSCROLL, WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
-    WS_VSCROLL,
+    SIF_RANGE, SIF_TRACKPOS, SIZE_MINIMIZED, SW_RESTORE, SW_SHOWDEFAULT, SW_SHOWNORMAL,
+    SWP_NOACTIVATE, SWP_NOZORDER, SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos,
+    SetWindowTextW, ShowWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage,
+    WINDOW_EX_STYLE, WM_CONTEXTMENU, WM_CREATE, WM_DESTROY, WM_DPICHANGED, WM_DROPFILES,
+    WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
+    WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_SIZE, WM_TIMER, WM_VSCROLL, WNDCLASSEXW,
+    WS_OVERLAPPEDWINDOW, WS_VSCROLL,
 };
 use windows::core::{PCWSTR, PWSTR, w};
 
@@ -73,6 +75,7 @@ const CMD_COPY: u32 = 901;
 const CMD_SELECT_ALL: u32 = 902;
 const CMD_CLEAR_SELECTION: u32 = 903;
 const CMD_FIND: u32 = 904;
+const CMD_SEARCH_WEB: u32 = 905;
 const CMD_FONT_BIZ_UD_GOTHIC: u32 = 1000;
 const CMD_FONT_SEGOE_UI: u32 = 1001;
 const CMD_FONT_YU_GOTHIC_UI: u32 = 1002;
@@ -341,12 +344,13 @@ impl AppState {
         }
     }
 
-    fn select_line_at(&mut self, hwnd: HWND, y: f32) {
+    fn select_sentence_at(&mut self, hwnd: HWND, x: f32, y: f32) {
         let Some(layout) = self.layout.as_ref() else {
             return;
         };
+        let x = pixels_to_dips(x, self.dpi);
         let y = pixels_to_dips(y, self.dpi) + self.scroll_y;
-        let Ok(Some((start, end))) = self.renderer.line_range_at(layout, y) else {
+        let Ok(Some((start, end))) = self.renderer.sentence_range_at(layout, x, y) else {
             return;
         };
         if start == end {
@@ -395,6 +399,22 @@ impl AppState {
             return;
         }
         if let Err(message) = copy_utf16_to_clipboard(hwnd, &text) {
+            show_error(Some(hwnd), &message);
+        }
+    }
+
+    fn search_selection_web(&self, hwnd: HWND) {
+        let Some((anchor, active)) = self.selection_range() else {
+            return;
+        };
+        let Some(layout) = self.layout.as_ref() else {
+            return;
+        };
+        let text = layout.selected_text(anchor, active);
+        let Some(url) = google_search_url(&String::from_utf16_lossy(&text)) else {
+            return;
+        };
+        if let Err(message) = open_in_default_browser(hwnd, &url) {
             show_error(Some(hwnd), &message);
         }
     }
@@ -809,8 +829,8 @@ unsafe extern "system" fn window_proc(
         }
         WM_LBUTTONDBLCLK => {
             if let Some(state) = state {
-                let (_, y) = mouse_coordinates(lparam);
-                state.select_line_at(hwnd, y);
+                let (x, y) = mouse_coordinates(lparam);
+                state.select_sentence_at(hwnd, x, y);
             }
             LRESULT(0)
         }
@@ -1073,6 +1093,7 @@ fn show_context_menu(hwnd: HWND, state: &mut AppState) {
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
     }
     append_action_item(menu, CMD_COPY, "Copy\tCtrl+C", has_selection);
+    append_action_item(menu, CMD_SEARCH_WEB, "Webで検索", has_selection);
     append_action_item(menu, CMD_SELECT_ALL, "Select all\tCtrl+A", has_text);
     append_action_item(
         menu,
@@ -1199,6 +1220,10 @@ fn show_context_menu(hwnd: HWND, state: &mut AppState) {
         }
         CMD_COPY => {
             state.copy_selection(hwnd);
+            return;
+        }
+        CMD_SEARCH_WEB => {
+            state.search_selection_web(hwnd);
             return;
         }
         CMD_SELECT_ALL => {
@@ -1483,6 +1508,54 @@ fn wide_null(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(Some(0)).collect()
 }
 
+fn google_search_url(selection: &str) -> Option<String> {
+    let query = selection.split_whitespace().collect::<Vec<_>>().join(" ");
+    if query.is_empty() {
+        return None;
+    }
+
+    Some(format!(
+        "https://www.google.com/search?q={}",
+        percent_encode_query(&query)
+    ))
+}
+
+fn percent_encode_query(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(byte as char);
+        } else {
+            encoded.push('%');
+            encoded.push(HEX[(byte >> 4) as usize] as char);
+            encoded.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+    }
+    encoded
+}
+
+fn open_in_default_browser(hwnd: HWND, url: &str) -> Result<(), String> {
+    let url = wide_null(url);
+    let result = unsafe {
+        ShellExecuteW(
+            Some(hwnd),
+            w!("open"),
+            PCWSTR(url.as_ptr()),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    if result.0 as isize <= 32 {
+        return Err(format!(
+            "Could not open the default browser.\n\nShellExecute error {}",
+            result.0 as isize
+        ));
+    }
+    Ok(())
+}
+
 fn window_title(path: Option<&Path>) -> String {
     path.and_then(Path::file_name)
         .map(|name| format!("{} - QuietMD", name.to_string_lossy()))
@@ -1570,6 +1643,18 @@ mod tests {
             "lighting-system-prep.md - QuietMD"
         );
         assert_eq!(window_title(None), "QuietMD");
+    }
+
+    #[test]
+    fn creates_a_google_search_url_from_selected_text() {
+        assert_eq!(
+            google_search_url("  QuietMD\n日本語 & search  "),
+            Some(
+                "https://www.google.com/search?q=QuietMD%20%E6%97%A5%E6%9C%AC%E8%AA%9E%20%26%20search"
+                    .to_string()
+            )
+        );
+        assert_eq!(google_search_url(" \r\n\t "), None);
     }
 
     #[test]
